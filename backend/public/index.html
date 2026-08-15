@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+  <head>
+    <title>My Notes App</title>
+  </head>
+  <body>
+    <h1>My notes</h1>
+    <ul id="notes">
+      <li>loading...</li>
+    </ul>
+    <script>
+      fetch("/api/notes")
+        .then((res) => res.json())
+        .then((notes) => {
+          const list = document.getElementById("notes");
+          list.innerHTML = "";
+          notes.forEach((note) => {
+            const item = document.createElement("li");
+            item.textContent = note.text;
+            list.appendChild(item);
+          });
+        });
+    </script>
+  </body>
+</html>
