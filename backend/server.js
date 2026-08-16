@@ -13,10 +13,6 @@ const notes = [
   { id: 3, text: "Water the plants" },
 ];
 
-app.get("/", (req, res) => {
-  res.send("Hello from Express!");
-});
-
 app.get("/api/notes", (req, res) => {
   res.json(notes);
 });
