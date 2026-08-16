@@ -24,16 +24,21 @@ places. Which one it uses is decided by configuration, not by code.
 
 | `S3_BUCKET` | Files go to       | Links are                              |
 | ----------- | ----------------- | -------------------------------------- |
-| unset       | `backend/uploads` | `/uploads/<key>`                       |
+| unset       | `backend/uploads` | `/uploads/<filename>`                  |
 | set         | that S3 bucket    | presigned URLs, valid for five minutes |
 
 The app prints which one it is using when it starts.
 
-Both are in `backend/storage/`, behind the same two functions, so nothing else
-in the app knows the difference:
+All of it is in `backend/uploads.js`. Uploads are handled by
+[multer](https://www.npmjs.com/package/multer), which is given one of two
+storage engines:
 
-- `save(key, buffer, contentType)` puts a file somewhere
-- `urlFor(key)` returns something a browser can fetch
+- `multer.diskStorage`, which writes the file to a folder
+- [`multer-s3`](https://www.npmjs.com/package/multer-s3), which sends it to a
+  bucket instead
+
+That file also exports `getFileUrl(filename)`, which turns a stored filename
+into a link the browser can open.
 
 Leaving `S3_BUCKET` unset means the app runs on a laptop with no AWS account,
 no bucket and no credentials.
@@ -44,6 +49,11 @@ no bucket and no credentials.
 > backed up, they are lost when that machine is replaced, and a second copy of
 > the app cannot see them.
 
-Note that `backend/storage/s3.js` contains no access key and no secret. The AWS
+Note that `backend/uploads.js` contains no access key and no secret. The AWS
 SDK looks for credentials in a fixed order, and finds your CLI profile on a
 laptop and the instance role when it runs on EC2.
+
+The bucket stays private. Nothing in it is publicly readable, so a note's
+attachment link is a presigned URL: a link with a signature and an expiry built
+into it. That is why a note stores the *name* of its file rather than a link to
+it, and why `GET /api/notes` works the links out fresh on every request.
