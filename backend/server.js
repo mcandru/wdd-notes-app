@@ -1,9 +1,18 @@
 import "dotenv/config";
 import express from "express";
+import mysql from "mysql2/promise";
 
 import { upload, getFileUrl, usingS3, uploadsDir } from "./uploads.js";
 
 const port = process.env.PORT || 8080;
+
+const db = await mysql.createPool({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+});
 
 const app = express();
 
@@ -15,20 +24,20 @@ if (!usingS3) {
   app.use("/uploads", express.static(uploadsDir));
 }
 
-const notes = [
-  { id: 1, text: "Buy milk", file: null },
-  { id: 2, text: "Finish the deployment tutorial", file: null },
-  { id: 3, text: "Water the plants", file: null },
-];
-
 app.get("/api/notes", async (req, res) => {
+  // Retrieve all notes from the database.
+  const results = await db.query(
+    "SELECT id, body AS text, attachment FROM notes ORDER BY id",
+  );
+  const notes = results[0];
+
   // A note stores the name of its file, not a link to it, because an S3 link
   // expires. So the link is worked out fresh every time the notes are sent.
   const withUrls = await Promise.all(
     notes.map(async (note) => {
-      if (!note.file) return note;
+      if (!note.attachment) return note;
 
-      return { ...note, url: await getFileUrl(note.file) };
+      return { ...note, url: await getFileUrl(note.attachment) };
     }),
   );
 
@@ -37,16 +46,23 @@ app.get("/api/notes", async (req, res) => {
 
 // upload.single("file") runs before this handler. By the time the handler is
 // reached the file has already been saved, and req.file describes where it is stored
-app.post("/api/notes", upload.single("file"), (req, res) => {
+app.post("/api/notes", upload.single("file"), async (req, res) => {
   const note = {
-    id: notes.length + 1,
     text: req.body.text,
     // multer-s3 calls it "key", diskStorage "filename".
     file: req.file ? req.file.key || req.file.filename : null,
   };
 
-  notes.push(note);
-  res.status(201).json(note);
+  const [result] = await db.execute(
+    "INSERT INTO notes (body, attachment) VALUES (?, ?)",
+    [note.text, note.file],
+  );
+
+  res.status(201).json({
+    id: result.insertId,
+    text: note.text,
+    attachment: note.file,
+  });
 });
 
 app.listen(port, () => {
