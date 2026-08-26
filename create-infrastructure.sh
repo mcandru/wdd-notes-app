@@ -14,14 +14,15 @@
 #   notes-db                      a MySQL database on RDS
 #   notes-app-containers-role     an IAM role, so the instance can open a
 #                                 Session Manager shell, use the bucket, pull
-#                                 an image, and read the database password
+#                                 an image, and read the app settings
 #
 # All of that is scenery from earlier tutorials. It deliberately does NOT
-# create the ECR repository, does NOT put the database password into Parameter
-# Store, and does NOT launch an instance. Those three are the tutorial.
+# create the ECR repository, does NOT put any of the app settings into
+# Parameter Store, and does NOT launch an instance. Those three are the
+# tutorial.
 #
-# The role is given permission to pull from a repository and to read a
-# parameter that do not exist yet. A policy can name a resource before the
+# The role is given permission to pull from a repository and to read
+# parameters that do not exist yet. A policy can name a resource before the
 # resource is made.
 #
 # The database is created without waiting for it. It takes several minutes,
@@ -38,7 +39,7 @@ DB_ID="notes-db"
 DB_SG_NAME="notes-db-sg"
 DB_USER="admin"
 DB_NAME="notes"
-PARAM_NAME="/notes-app/db-password"
+PARAM_PATH="/notes-app"
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 BUCKET="${1:-notes-app-uploads-$ACCOUNT_ID}"
@@ -87,7 +88,16 @@ fi
 # letters and digits only.
 # ---------------------------------------------------------------------------
 
-DB_PASSWORD=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
+# `tr < /dev/urandom | head -c 24` is the usual way to write this and it does
+# not work here. /dev/urandom never ends, so `head` exits as soon as it has its
+# 24 characters and `tr` is killed by SIGPIPE. Under `set -o pipefail` that
+# makes the whole line fail, and `set -e` then stops the script.
+#
+# Taking a fixed number of bytes first means nothing is killed. 512 bytes leaves
+# roughly 120 letters and digits, and the first 24 of those are the password.
+
+RANDOM_CHARS=$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')
+DB_PASSWORD=${RANDOM_CHARS:0:24}
 DB_EXISTED=no
 
 # ---------------------------------------------------------------------------
@@ -105,6 +115,13 @@ VPC_ID=$(aws ec2 describe-vpcs \
   --filters "Name=isDefault,Values=true" \
   --query 'Vpcs[0].VpcId' \
   --output text)
+
+if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+  echo "There is no default VPC in $REGION." >&2
+  echo "Create one in the console under VPC, Your VPCs, Actions, Create default VPC," >&2
+  echo "then run this script again." >&2
+  exit 1
+fi
 
 find_sg() {
   aws ec2 describe-security-groups \
@@ -128,12 +145,16 @@ else
     --vpc-id "$VPC_ID" \
     --query 'GroupId' \
     --output text)
-
-  aws ec2 authorize-security-group-ingress \
-    --region "$REGION" \
-    --group-id "$APP_SG_ID" \
-    --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null
 fi
+
+# The rule is added outside that block, so that a group left without one by a
+# run that stopped half way through gets it on the next run. Adding a rule that
+# is already there is an error, and `|| true` is what ignores it.
+
+aws ec2 authorize-security-group-ingress \
+  --region "$REGION" \
+  --group-id "$APP_SG_ID" \
+  --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
 
 DB_SG_ID=$(find_sg "$DB_SG_NAME")
 
@@ -149,12 +170,12 @@ else
     --vpc-id "$VPC_ID" \
     --query 'GroupId' \
     --output text)
-
-  aws ec2 authorize-security-group-ingress \
-    --region "$REGION" \
-    --group-id "$DB_SG_ID" \
-    --protocol tcp --port 3306 --source-group "$APP_SG_ID" >/dev/null
 fi
+
+aws ec2 authorize-security-group-ingress \
+  --region "$REGION" \
+  --group-id "$DB_SG_ID" \
+  --protocol tcp --port 3306 --source-group "$APP_SG_ID" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # 4. The database
@@ -214,11 +235,14 @@ else
         "Action": "sts:AssumeRole"
       }]
     }' >/dev/null
-
-  aws iam attach-role-policy \
-    --role-name "$NAME-role" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 fi
+
+# Attaching a policy that is already attached succeeds and changes nothing, so
+# this runs every time rather than only when the role is created.
+
+aws iam attach-role-policy \
+  --role-name "$NAME-role" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 
 echo "Granting $NAME-role read and write access to $BUCKET"
 
@@ -266,26 +290,35 @@ aws iam put-role-policy \
     ]
   }"
 
-# Reading a SecureString needs two permissions, because Parameter Store hands
-# back an encrypted value and KMS is what decrypts it. The condition limits the
-# decrypt permission to requests that came through Parameter Store.
+# The instance reads every setting the app needs out of one place in Parameter
+# Store, so it needs to list the path as well as read the values under it.
+# Decryption is a separate permission again, because DB_PASSWORD is stored
+# encrypted. The condition limits that to requests that came through Parameter
+# Store.
 
-echo "Granting $NAME-role permission to read $PARAM_NAME"
+echo "Granting $NAME-role permission to read $PARAM_PATH/*"
 
 aws iam put-role-policy \
   --role-name "$NAME-role" \
-  --policy-name NotesAppDatabasePassword \
+  --policy-name NotesAppConfiguration \
   --policy-document "{
     \"Version\": \"2012-10-17\",
     \"Statement\": [
       {
-        \"Sid\": \"ReadThePassword\",
+        \"Sid\": \"ReadTheSettings\",
         \"Effect\": \"Allow\",
-        \"Action\": \"ssm:GetParameter\",
-        \"Resource\": \"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM_NAME\"
+        \"Action\": [
+          \"ssm:GetParameter\",
+          \"ssm:GetParameters\",
+          \"ssm:GetParametersByPath\"
+        ],
+        \"Resource\": [
+          \"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM_PATH\",
+          \"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM_PATH/*\"
+        ]
       },
       {
-        \"Sid\": \"DecryptIt\",
+        \"Sid\": \"DecryptTheSecretOnes\",
         \"Effect\": \"Allow\",
         \"Action\": \"kms:Decrypt\",
         \"Resource\": \"*\",
@@ -305,14 +338,21 @@ else
   echo "Creating instance profile $NAME-role"
 
   aws iam create-instance-profile --instance-profile-name "$NAME-role" >/dev/null
-  aws iam add-role-to-instance-profile \
-    --instance-profile-name "$NAME-role" \
-    --role-name "$NAME-role"
 fi
 
+# A profile holds one role, and putting the role in again is an error, so the
+# same `|| true` applies. An empty profile left behind by an earlier run is
+# filled in here rather than being skipped.
+
+aws iam add-role-to-instance-profile \
+  --instance-profile-name "$NAME-role" \
+  --role-name "$NAME-role" >/dev/null 2>&1 || true
+
 if [ "$DB_EXISTED" = yes ]; then
+  DB_LINE="Database   $DB_ID (already existed)"
   PASSWORD_LINE="Password   unchanged, use the one you saved when it was created"
 else
+  DB_LINE="Database   $DB_ID (still creating)"
   PASSWORD_LINE="Password   $DB_PASSWORD"
 fi
 
@@ -321,16 +361,10 @@ cat <<SUMMARY
 Done.
 
   Bucket     $BUCKET
-  Database   $DB_ID (still creating)
+  $DB_LINE
   $PASSWORD_LINE
   Security   $NAME-sg ($APP_SG_ID), $DB_SG_NAME ($DB_SG_ID)
   Role       $NAME-role
   Registry   $REGISTRY
-
-Keep that password. It is not stored anywhere yet, and this is the only time
-it is printed.
-
-There is no repository, no stored password, and no instance. Making those three
-is the tutorial.
 
 SUMMARY
