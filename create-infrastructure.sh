@@ -68,6 +68,13 @@ else
   aws iam add-role-to-instance-profile \
     --instance-profile-name "$NAME-role" \
     --role-name "$NAME-role"
+
+  # IAM is eventually consistent, so a profile made a second ago is not
+  # necessarily being handed out to instances yet. An instance that boots
+  # before it is gets no credentials, the SSM agent fails to register, and the
+  # machine ends up running fine but unreachable through Session Manager.
+  echo "Waiting for the new instance profile to become usable"
+  sleep 15
 fi
 
 # ---------------------------------------------------------------------------
@@ -184,6 +191,12 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now notes
+
+# The SSM agent starts a couple of seconds into boot, which can be before this
+# machine's credentials are available. If that happens it stops trying, and
+# Session Manager cannot reach the instance. By the time the boot script gets
+# here the credentials are there, so restarting the agent lets it register.
+systemctl restart amazon-ssm-agent
 TEMPLATE
 
 sed -e "s|__REPO__|$REPO|" \
