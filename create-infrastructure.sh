@@ -1,36 +1,166 @@
 #!/usr/bin/env bash
 #
-# Creates the infrastructure for the notes app, running with files stored on
-# the instance's own disk.
-#
-#   ./create-infrastructure.sh
-#
-# It makes:
-#
-#   notes-app-s3-role   an IAM role, so Session Manager can reach the instance
-#   notes-app-s3-sg     a security group allowing HTTP in, and nothing else
-#   notes-app-s3        a t3.micro running the app on port 80
-#
-# It deliberately does NOT give the role any S3 permission, and does not set
-# S3_BUCKET. Adding those is what will be done in the tutorial.
-#
-# Safe to run again if it fails part way through.
+# Builds the notes app, pushes it to a private registry, and runs it on an EC2
+# instance, so that the CloudFront tutorial has something to put HTTPS in front
+# of.
 
 set -euo pipefail
 
 REGION="eu-west-1"
-NAME="notes-app-s3"
-REPO="https://github.com/mcandru/wdd-notes-app.git"
-BRANCH="storing-files-s3"
+NAME="notes-app-cloudfront"
+PARAM_PATH="/notes-app-cloudfront"
+
+# The Dockerfile and user-data.sh are both next to this script, at the top of
+# the repository. They are found from where the script is rather than from
+# wherever you ran it.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+if [ ! -f "$SCRIPT_DIR/Dockerfile" ] || [ ! -f "$SCRIPT_DIR/user-data.sh" ]; then
+  echo "There is no Dockerfile or user-data.sh in $SCRIPT_DIR." >&2
+  echo "This script has to be at the top of the notes app repository." >&2
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker isn't running. Start Docker Desktop and run this script again." >&2
+  exit 1
+fi
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BUCKET="${1:-$NAME-uploads-$ACCOUNT_ID}"
+REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+IMAGE="$REGISTRY/$NAME:latest"
 
 echo "Creating infrastructure in $REGION"
 echo
 
 # ---------------------------------------------------------------------------
-# 1. The IAM role
-#
-# The role lets the instance prove who it is to AWS. AmazonSSMManagedInstanceCore
-# is what allows Session Manager to open a shell on it.
+# 1. The bucket
+# ---------------------------------------------------------------------------
+
+if aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
+  echo "Bucket $BUCKET already exists"
+else
+  echo "Creating bucket $BUCKET"
+
+  if ! aws s3api create-bucket \
+    --bucket "$BUCKET" \
+    --region "$REGION" \
+    --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null 2>&1; then
+    echo "Could not create the bucket $BUCKET." >&2
+    echo "The name is probably taken by another AWS account. Run the script again" >&2
+    echo "with a name of your own, for example:" >&2
+    echo "  ./create-infrastructure.sh notes-app-cloudfront-uploads-yourname" >&2
+    exit 1
+  fi
+
+  aws s3api put-public-access-block \
+    --bucket "$BUCKET" \
+    --public-access-block-configuration \
+      "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. The repository and the image
+# ---------------------------------------------------------------------------
+
+if aws ecr describe-repositories --region "$REGION" --repository-names "$NAME" >/dev/null 2>&1; then
+  echo "Repository $NAME already exists"
+else
+  echo "Creating repository $NAME"
+
+  aws ecr create-repository \
+    --region "$REGION" \
+    --repository-name "$NAME" >/dev/null
+fi
+
+echo "Building the image, which can take a few minutes"
+
+docker build \
+  --platform linux/amd64 \
+  --target production \
+  -t "$IMAGE" \
+  "$SCRIPT_DIR"
+
+echo "Pushing the image to $REGISTRY"
+
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
+
+docker push "$IMAGE"
+
+# ---------------------------------------------------------------------------
+# 3. The settings
+# ---------------------------------------------------------------------------
+
+echo "Storing the settings under $PARAM_PATH/"
+
+aws ssm put-parameter \
+  --region "$REGION" \
+  --name "$PARAM_PATH/S3_BUCKET" \
+  --type String \
+  --value "$BUCKET" \
+  --overwrite >/dev/null
+
+aws ssm put-parameter \
+  --region "$REGION" \
+  --name "$PARAM_PATH/AWS_REGION" \
+  --type String \
+  --value "$REGION" \
+  --overwrite >/dev/null
+
+# ---------------------------------------------------------------------------
+# 4. The security group
+# ---------------------------------------------------------------------------
+
+VPC_ID=$(aws ec2 describe-vpcs \
+  --region "$REGION" \
+  --filters "Name=isDefault,Values=true" \
+  --query 'Vpcs[0].VpcId' \
+  --output text)
+
+if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+  echo "There is no default VPC in $REGION." >&2
+  echo "Create one in the console under VPC, Your VPCs, Actions, Create default VPC," >&2
+  echo "then run this script again." >&2
+  exit 1
+fi
+
+SG_ID=$(aws ec2 describe-security-groups \
+  --region "$REGION" \
+  --filters "Name=group-name,Values=$NAME-sg" "Name=vpc-id,Values=$VPC_ID" \
+  --query 'SecurityGroups[0].GroupId' \
+  --output text 2>/dev/null || true)
+
+if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+  echo "Security group $NAME-sg already exists ($SG_ID)"
+  SG_EXISTED=yes
+else
+  echo "Creating security group $NAME-sg"
+
+  SG_ID=$(aws ec2 create-security-group \
+    --region "$REGION" \
+    --group-name "$NAME-sg" \
+    --description "Notes app behind CloudFront: HTTP in" \
+    --vpc-id "$VPC_ID" \
+    --query 'GroupId' \
+    --output text)
+  SG_EXISTED=no
+fi
+
+# The rule is only added to a new group. If the group already exists you may
+# have replaced this rule with the CloudFront one, and adding it back would
+# open the instance to everyone again.
+
+if [ "$SG_EXISTED" = no ]; then
+  aws ec2 authorize-security-group-ingress \
+    --region "$REGION" \
+    --group-id "$SG_ID" \
+    --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# 5. The IAM role
 # ---------------------------------------------------------------------------
 
 if aws iam get-role --role-name "$NAME-role" >/dev/null 2>&1; then
@@ -48,217 +178,193 @@ else
         "Action": "sts:AssumeRole"
       }]
     }' >/dev/null
-
-  aws iam attach-role-policy \
-    --role-name "$NAME-role" \
-    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 fi
 
-# An EC2 instance cannot be given a role directly. It is given an "instance
-# profile", which is a container holding exactly one role. The console makes
-# this for you silently. From the CLI you have to make it yourself, and
-# forgetting to is the usual reason a scripted instance is unreachable.
+aws iam attach-role-policy \
+  --role-name "$NAME-role" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+aws iam put-role-policy \
+  --role-name "$NAME-role" \
+  --policy-name NotesAppUploads \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"ReadWriteUploads\",
+      \"Effect\": \"Allow\",
+      \"Action\": [\"s3:PutObject\", \"s3:GetObject\"],
+      \"Resource\": \"arn:aws:s3:::$BUCKET/*\"
+    }]
+  }"
+
+# GetAuthorizationToken is the login step and cannot be limited to one
+# repository. The three actions that read an image are limited to this one.
+
+aws iam put-role-policy \
+  --role-name "$NAME-role" \
+  --policy-name NotesAppPullImage \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Sid\": \"LogIntoTheRegistry\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"ecr:GetAuthorizationToken\",
+        \"Resource\": \"*\"
+      },
+      {
+        \"Sid\": \"PullThisRepository\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"ecr:BatchGetImage\",
+          \"ecr:GetDownloadUrlForLayer\",
+          \"ecr:BatchCheckLayerAvailability\"
+        ],
+        \"Resource\": \"arn:aws:ecr:$REGION:$ACCOUNT_ID:repository/$NAME\"
+      }
+    ]
+  }"
+
+# Neither setting is a SecureString, so no kms:Decrypt is needed.
+
+aws iam put-role-policy \
+  --role-name "$NAME-role" \
+  --policy-name NotesAppConfiguration \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"ReadTheSettings\",
+      \"Effect\": \"Allow\",
+      \"Action\": [
+        \"ssm:GetParameter\",
+        \"ssm:GetParameters\",
+        \"ssm:GetParametersByPath\"
+      ],
+      \"Resource\": [
+        \"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM_PATH\",
+        \"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM_PATH/*\"
+      ]
+    }]
+  }"
+
+# An EC2 instance is given an instance profile, which holds exactly one role.
+
+PROFILE_CREATED=no
 
 if aws iam get-instance-profile --instance-profile-name "$NAME-role" >/dev/null 2>&1; then
   echo "Instance profile $NAME-role already exists"
 else
   echo "Creating instance profile $NAME-role"
-
   aws iam create-instance-profile --instance-profile-name "$NAME-role" >/dev/null
-  aws iam add-role-to-instance-profile \
-    --instance-profile-name "$NAME-role" \
-    --role-name "$NAME-role"
-
-  # IAM is eventually consistent, so a profile made a second ago is not
-  # necessarily being handed out to instances yet. An instance that boots
-  # before it is gets no credentials, the SSM agent fails to register, and the
-  # machine ends up running fine but unreachable through Session Manager.
-  echo "Waiting for the new instance profile to become usable"
-  sleep 15
+  PROFILE_CREATED=yes
 fi
 
+aws iam add-role-to-instance-profile \
+  --instance-profile-name "$NAME-role" \
+  --role-name "$NAME-role" >/dev/null 2>&1 || true
+
 # ---------------------------------------------------------------------------
-# 2. The security group
-#
-# Port 80 from anywhere, and nothing else. No SSH, because Session Manager
-# does not need an open port.
+# 6. The instance
 # ---------------------------------------------------------------------------
 
-SG_ID=$(aws ec2 describe-security-groups \
+INSTANCE_ID=$(aws ec2 describe-instances \
   --region "$REGION" \
-  --filters "Name=group-name,Values=$NAME-sg" \
-  --query 'SecurityGroups[0].GroupId' \
-  --output text 2>/dev/null || true)
-
-if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
-  echo "Security group $NAME-sg already exists ($SG_ID)"
-else
-  echo "Creating security group $NAME-sg"
-
-  VPC_ID=$(aws ec2 describe-vpcs \
-    --region "$REGION" \
-    --filters "Name=isDefault,Values=true" \
-    --query 'Vpcs[0].VpcId' \
-    --output text)
-
-  SG_ID=$(aws ec2 create-security-group \
-    --region "$REGION" \
-    --group-name "$NAME-sg" \
-    --description "Notes app: HTTP in, nothing else" \
-    --vpc-id "$VPC_ID" \
-    --query 'GroupId' \
-    --output text)
-
-  aws ec2 authorize-security-group-ingress \
-    --region "$REGION" \
-    --group-id "$SG_ID" \
-    --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null
-fi
-
-# ---------------------------------------------------------------------------
-# 3. The machine image
-#
-# Asking AWS for the current Amazon Linux 2023 image, rather than hardcoding an
-# ID. Image IDs change whenever AWS publishes a new build, and they are
-# different in every region.
-# ---------------------------------------------------------------------------
-
-AMI_ID=$(aws ssm get-parameters \
-  --region "$REGION" \
-  --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-  --query 'Parameters[0].Value' \
+  --filters "Name=tag:Name,Values=$NAME" \
+            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query 'Reservations[0].Instances[0].InstanceId' \
   --output text)
 
-echo "Using image $AMI_ID"
-
-# ---------------------------------------------------------------------------
-# 4. The boot script
-#
-# Everything the instance does to itself on first boot. Note that it writes a
-# .env with PORT only. There is no S3_BUCKET, so the app will store uploaded
-# files on this machine's own disk.
-# ---------------------------------------------------------------------------
-
-USER_DATA=$(mktemp)
-trap 'rm -f "$USER_DATA" "$USER_DATA.template"' EXIT
-
-cat > "$USER_DATA.template" <<'TEMPLATE'
-#!/usr/bin/env bash
-set -e
-
-dnf install -y nodejs22 git
-
-# Let Node listen on port 80 without running the whole app as root
-setcap 'cap_net_bind_service=+ep' "$(readlink -f "$(which node)")"
-
-# Swap, so the frontend build cannot run out of memory on a t3.micro
-dd if=/dev/zero of=/swapfile bs=1M count=1024
-chmod 600 /swapfile
-mkswap /swapfile
-swapon /swapfile
-
-# The app belongs to ec2-user, not to root
-su - ec2-user -c '
-  git clone __REPO__
-  cd wdd-notes-app
-  git checkout __BRANCH__
-
-  cd backend
-  npm install
-  echo "PORT=80" > .env
-
-  cd ../frontend
-  npm install
-  npm run build
-'
-
-cat > /etc/systemd/system/notes.service <<'EOF'
-[Unit]
-Description=Notes app
-After=network.target
-
-[Service]
-Type=simple
-User=ec2-user
-WorkingDirectory=/home/ec2-user/wdd-notes-app/backend
-ExecStart=/usr/bin/node server.js
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now notes
-
-# The SSM agent starts a couple of seconds into boot, which can be before this
-# machine's credentials are available. If that happens it stops trying, and
-# Session Manager cannot reach the instance. By the time the boot script gets
-# here the credentials are there, so restarting the agent lets it register.
-systemctl restart amazon-ssm-agent
-TEMPLATE
-
-sed -e "s|__REPO__|$REPO|" \
-    -e "s|__BRANCH__|$BRANCH|" \
-    "$USER_DATA.template" > "$USER_DATA"
-
-# ---------------------------------------------------------------------------
-# 5. Launch it
-#
-# IAM is eventually consistent, so an instance profile created seconds ago may
-# not be visible to EC2 yet. That is what the retry is for.
-# ---------------------------------------------------------------------------
-
-echo "Launching $NAME"
-
-INSTANCE_ID=""
-
-for attempt in 1 2 3 4 5 6; do
-  if INSTANCE_ID=$(aws ec2 run-instances \
+if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+  echo "Instance $NAME already exists ($INSTANCE_ID)"
+else
+  AMI_ID=$(aws ssm get-parameter \
     --region "$REGION" \
-    --image-id "$AMI_ID" \
-    --instance-type t3.micro \
-    --iam-instance-profile "Name=$NAME-role" \
-    --security-group-ids "$SG_ID" \
-    --user-data "file://$USER_DATA" \
-    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
-    --query 'Instances[0].InstanceId' \
-    --output text 2>/dev/null); then
-    break
+    --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+    --query 'Parameter.Value' \
+    --output text)
+
+  # A new instance profile takes a few seconds to become usable, and launching
+  # with it before then fails with "Invalid IAM Instance Profile". Trying again
+  # every few seconds is how AWS's own tools deal with that.
+
+  if [ "$PROFILE_CREATED" = yes ]; then
+    echo "Waiting for the instance profile to be ready"
+    sleep 10
   fi
 
-  echo "  the new role is not visible to EC2 yet, waiting (attempt $attempt)"
-  sleep 10
-  INSTANCE_ID=""
-done
+  echo "Launching instance $NAME"
 
-if [ -z "$INSTANCE_ID" ]; then
-  echo "Could not launch the instance. Run the last command again by hand to see the error." >&2
-  exit 1
+  for attempt in 1 2 3 4 5 6; do
+    if OUTPUT=$(aws ec2 run-instances \
+      --region "$REGION" \
+      --image-id "$AMI_ID" \
+      --instance-type t3.micro \
+      --security-group-ids "$SG_ID" \
+      --iam-instance-profile "Name=$NAME-role" \
+      --user-data "file://$SCRIPT_DIR/user-data.sh" \
+      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
+      --query 'Instances[0].InstanceId' \
+      --output text 2>&1); then
+      INSTANCE_ID="$OUTPUT"
+      break
+    fi
+
+    if [ "$attempt" = 6 ]; then
+      echo "Could not launch the instance. AWS said:" >&2
+      echo "  $OUTPUT" >&2
+      exit 1
+    fi
+
+    sleep 5
+  done
 fi
 
 echo "Waiting for $INSTANCE_ID to start"
 aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 
-PUBLIC_IP=$(aws ec2 describe-instances \
+PUBLIC_DNS=$(aws ec2 describe-instances \
   --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \
-  --query 'Reservations[0].Instances[0].PublicIpAddress' \
+  --query 'Reservations[0].Instances[0].PublicDnsName' \
   --output text)
+
+# The instance is running before its user data has finished installing Docker
+# and starting the app, which takes another minute or two. Checking here means
+# the summary only says the app is up when it is.
+
+echo "Waiting for the app to answer on http://$PUBLIC_DNS"
+
+APP_UP=no
+for _ in $(seq 1 36); do
+  if curl -fs -o /dev/null --max-time 5 "http://$PUBLIC_DNS/api/notes"; then
+    APP_UP=yes
+    break
+  fi
+  sleep 5
+done
+
+if [ "$APP_UP" = yes ]; then
+  STATUS_LINE="The app is running at http://$PUBLIC_DNS"
+else
+  STATUS_LINE="The app has not answered yet. If you have already locked the
+security group down to CloudFront, that is expected. Otherwise open a
+shell with Session Manager and run: sudo cat /var/log/cloud-init-output.log"
+fi
 
 cat <<SUMMARY
 
 Done.
 
-  Instance   $INSTANCE_ID
-  Address    http://$PUBLIC_IP
-  Security   $SG_ID
+  Bucket     $BUCKET
+  Image      $IMAGE
+  Settings   $PARAM_PATH/S3_BUCKET, $PARAM_PATH/AWS_REGION
+  Security   $NAME-sg ($SG_ID)
+  Role       $NAME-role
+  Instance   $NAME ($INSTANCE_ID)
 
-The machine is running, but it is still installing the app. Give it three or
-four minutes, then open that address.
+$STATUS_LINE
 
-  Shell      aws ssm start-session --target $INSTANCE_ID
+There is no Elastic IP and no CloudFront distribution. Making those two is
+the tutorial.
 
 SUMMARY
