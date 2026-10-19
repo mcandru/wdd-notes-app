@@ -1,36 +1,33 @@
 #!/usr/bin/env bash
 #
-# Deletes everything create-infrastructure.sh made, and any instance you
-# launched yourself into its security group.
+# Deletes everything create-infrastructure.sh made.
+#
+#   ./destroy-infrastructure.sh [-y]
+#
 
 set -euo pipefail
 
 REGION="eu-west-1"
-NAME="notes-app-cloudfront"
-PARAM_PATH="/notes-app-cloudfront/"
+NAME="notes-app-domain"
 
 SKIP_CONFIRM=no
-BUCKET_ARG=""
 
 for arg in "$@"; do
   case "$arg" in
     -y|--yes) SKIP_CONFIRM=yes ;;
-    *) BUCKET_ARG="$arg" ;;
   esac
 done
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="${BUCKET_ARG:-$NAME-uploads-$ACCOUNT_ID}"
 
-echo "This deletes the CloudFront tutorial's infrastructure in $REGION, from account $ACCOUNT_ID:"
+echo "This deletes the domain names tutorial's infrastructure, from account $ACCOUNT_ID:"
 echo
-echo "  Every instance named $NAME or in $NAME-sg"
-echo "  The repository $NAME and every image in it"
-echo "  The bucket $BUCKET and everything in it"
-echo "  Every parameter under $PARAM_PATH"
+echo "  The CloudFront distribution $NAME"
+echo "  Every instance named $NAME or in $NAME-sg, in $REGION"
+echo "  The Elastic IP $NAME"
 echo "  The security group and the role"
 echo
-echo "None of it can be recovered."
+echo "Your hosted zone and your certificate are not deleted."
 echo
 
 if [ "$SKIP_CONFIRM" != yes ]; then
@@ -42,19 +39,69 @@ if [ "$SKIP_CONFIRM" != yes ]; then
   echo
 fi
 
-SG_ID=$(aws ec2 describe-security-groups \
-  --region "$REGION" \
-  --filters "Name=group-name,Values=$NAME-sg" \
-  --query 'SecurityGroups[0].GroupId' \
-  --output text 2>/dev/null || true)
+# ---------------------------------------------------------------------------
+# 1. The distribution
+#
+# A distribution has to be disabled, and the change fully deployed, before it
+# can be deleted. Each change has to quote the ETag from the step before it,
+# which is how CloudFront stops two changes overwriting each other.
+# ---------------------------------------------------------------------------
+
+DIST_ID=$(aws cloudfront list-distributions \
+  --query "DistributionList.Items[?Comment=='$NAME'].Id | [0]" \
+  --output text)
+
+if [ -n "$DIST_ID" ] && [ "$DIST_ID" != "None" ]; then
+  DIST_ENABLED=$(aws cloudfront get-distribution \
+    --id "$DIST_ID" \
+    --query 'Distribution.DistributionConfig.Enabled' \
+    --output text)
+
+  if [ "$DIST_ENABLED" = "True" ]; then
+    echo "Disabling distribution $DIST_ID"
+
+    CONFIG_FILE=$(mktemp)
+    ETAG=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query ETag --output text)
+    aws cloudfront get-distribution-config \
+      --id "$DIST_ID" \
+      --query DistributionConfig \
+      --output json > "$CONFIG_FILE"
+
+    # Only the top level "Enabled" is indented by exactly four spaces. The
+    # nested ones, such as the logging setting, are indented further.
+    sed -i.bak 's/^    "Enabled": true/    "Enabled": false/' "$CONFIG_FILE"
+
+    aws cloudfront update-distribution \
+      --id "$DIST_ID" \
+      --if-match "$ETAG" \
+      --distribution-config "file://$CONFIG_FILE" >/dev/null
+
+    rm -f "$CONFIG_FILE" "$CONFIG_FILE.bak"
+  fi
+
+  echo "Waiting for $DIST_ID to finish disabling, which can take ten to fifteen minutes"
+  aws cloudfront wait distribution-deployed --id "$DIST_ID"
+
+  echo "Deleting distribution $DIST_ID"
+  ETAG=$(aws cloudfront get-distribution --id "$DIST_ID" --query ETag --output text)
+  aws cloudfront delete-distribution --id "$DIST_ID" --if-match "$ETAG"
+else
+  echo "Distribution $NAME is already gone"
+fi
 
 # ---------------------------------------------------------------------------
-# 1. The instances
+# 2. The instances
 #
 # Found by name and by security group. A replacement launched in the console
 # is in the group even if it was given a different name, and the group can't
 # be deleted while any instance is still using it.
 # ---------------------------------------------------------------------------
+
+SG_ID=$(aws ec2 describe-security-groups \
+  --region "$REGION" \
+  --filters "Name=group-name,Values=$NAME-sg" \
+  --query 'SecurityGroups[0].GroupId' \
+  --output text 2>/dev/null || true)
 
 LIVE_STATES="Name=instance-state-name,Values=pending,running,stopping,stopped"
 
@@ -80,66 +127,39 @@ if [ -n "$INSTANCE_IDS" ]; then
   echo "Terminating $INSTANCE_IDS"
   # shellcheck disable=SC2086
   aws ec2 terminate-instances --region "$REGION" --instance-ids $INSTANCE_IDS >/dev/null
+
+  echo "Waiting for the instances to terminate"
+  # shellcheck disable=SC2086
+  aws ec2 wait instance-terminated --region "$REGION" --instance-ids $INSTANCE_IDS
 else
   echo "No instances to terminate"
 fi
 
 # ---------------------------------------------------------------------------
-# 2. The repository
+# 3. The Elastic IP
 #
-# --force is what allows a repository that still has images in it to go.
+# Terminating the instance detached it, and an address that isn't attached to
+# anything is still charged.
 # ---------------------------------------------------------------------------
 
-if aws ecr describe-repositories --region "$REGION" --repository-names "$NAME" >/dev/null 2>&1; then
-  echo "Deleting repository $NAME and its images"
-  aws ecr delete-repository --region "$REGION" --repository-name "$NAME" --force >/dev/null
-else
-  echo "Repository $NAME is already gone"
-fi
-
-# ---------------------------------------------------------------------------
-# 3. The bucket
-#
-# A bucket has to be empty before it can be deleted.
-# ---------------------------------------------------------------------------
-
-if aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
-  echo "Emptying and deleting bucket $BUCKET"
-  aws s3 rm "s3://$BUCKET" --recursive >/dev/null
-  aws s3 rb "s3://$BUCKET" >/dev/null
-else
-  echo "Bucket $BUCKET is already gone"
-fi
-
-# ---------------------------------------------------------------------------
-# 4. The settings
-# ---------------------------------------------------------------------------
-
-PARAM_NAMES=$(aws ssm get-parameters-by-path \
+ALLOCATION_IDS=$(aws ec2 describe-addresses \
   --region "$REGION" \
-  --path "$PARAM_PATH" \
-  --query 'Parameters[].Name' \
+  --filters "Name=tag:Name,Values=$NAME" \
+  --query 'Addresses[].AllocationId' \
   --output text)
 
-if [ -n "$PARAM_NAMES" ] && [ "$PARAM_NAMES" != "None" ]; then
-  echo "Deleting parameters under $PARAM_PATH"
-  # shellcheck disable=SC2086
-  aws ssm delete-parameters --region "$REGION" --names $PARAM_NAMES >/dev/null
+if [ -n "$ALLOCATION_IDS" ] && [ "$ALLOCATION_IDS" != "None" ]; then
+  for allocation in $ALLOCATION_IDS; do
+    echo "Releasing Elastic IP $allocation"
+    aws ec2 release-address --region "$REGION" --allocation-id "$allocation"
+  done
 else
-  echo "No parameters under $PARAM_PATH"
+  echo "Elastic IP $NAME is already gone"
 fi
 
 # ---------------------------------------------------------------------------
-# 5. The security group
-#
-# It can't go until every instance using it has finished terminating.
+# 4. The security group
 # ---------------------------------------------------------------------------
-
-if [ -n "$INSTANCE_IDS" ]; then
-  echo "Waiting for the instances to terminate"
-  # shellcheck disable=SC2086
-  aws ec2 wait instance-terminated --region "$REGION" --instance-ids $INSTANCE_IDS
-fi
 
 if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
   echo "Deleting security group $NAME-sg ($SG_ID)"
@@ -149,10 +169,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. The role and its instance profile
+# 5. The role and its instance profile
 #
 # A role can't be deleted while anything is still attached to it, so its
-# policies come off first and the profile it sits in goes with it.
+# policy comes off first and the profile it sits in goes with it.
 # ---------------------------------------------------------------------------
 
 if aws iam get-instance-profile --instance-profile-name "$NAME-role" >/dev/null 2>&1; then
@@ -170,10 +190,6 @@ fi
 if aws iam get-role --role-name "$NAME-role" >/dev/null 2>&1; then
   echo "Deleting role $NAME-role"
 
-  for policy in $(aws iam list-role-policies --role-name "$NAME-role" --query 'PolicyNames[]' --output text); do
-    aws iam delete-role-policy --role-name "$NAME-role" --policy-name "$policy"
-  done
-
   for arn in $(aws iam list-attached-role-policies --role-name "$NAME-role" --query 'AttachedPolicies[].PolicyArn' --output text); do
     aws iam detach-role-policy --role-name "$NAME-role" --policy-arn "$arn"
   done
@@ -183,27 +199,11 @@ else
   echo "Role $NAME-role is already gone"
 fi
 
-# An Elastic IP that isn't attached to anything is still charged, and
-# terminating the instance has just detached yours.
-
-LOOSE_IPS=$(aws ec2 describe-addresses \
-  --region "$REGION" \
-  --query 'Addresses[?AssociationId==null].PublicIp' \
-  --output text)
-
 cat <<SUMMARY
 
 Done. Everything the script created has been deleted.
 
+Your hosted zone is still there. Delete your certificate in Certificate
+Manager, in us-east-1, now that the distribution that used it is gone.
+
 SUMMARY
-
-if [ -n "$LOOSE_IPS" ] && [ "$LOOSE_IPS" != "None" ]; then
-  cat <<WARNING
-These Elastic IPs are not attached to anything, and are still being charged:
-
-  $LOOSE_IPS
-
-Release them in EC2, Elastic IPs, Actions, Release Elastic IP addresses.
-
-WARNING
-fi

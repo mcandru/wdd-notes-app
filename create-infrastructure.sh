@@ -1,116 +1,39 @@
 #!/usr/bin/env bash
 #
-# Builds the notes app, pushes it to a private registry, and runs it on an EC2
-# instance, so that the CloudFront tutorial has something to put HTTPS in front
-# of.
+# Runs the notes app on an EC2 instance with a CloudFront distribution in front
+# of it, so that the domain names tutorial has something to point a name at.
+#
+#   ./create-infrastructure.sh
+#
 
 set -euo pipefail
 
 REGION="eu-west-1"
-NAME="notes-app-cloudfront"
-PARAM_PATH="/notes-app-cloudfront"
+NAME="notes-app-domain"
 
-# The Dockerfile and user-data.sh are both next to this script, at the top of
-# the repository. They are found from where the script is rather than from
-# wherever you ran it.
+# The IDs of two policies that AWS manages. They're the same in every account.
+CACHING_DISABLED="4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+ALL_VIEWER_EXCEPT_HOST="b689b0a8-53d0-40ab-baf2-68738e2966ac"
+
+# user-data.sh is next to this script. It is found from where the script is
+# rather than from wherever you ran it.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
-if [ ! -f "$SCRIPT_DIR/Dockerfile" ] || [ ! -f "$SCRIPT_DIR/user-data.sh" ]; then
-  echo "There is no Dockerfile or user-data.sh in $SCRIPT_DIR." >&2
-  echo "This script has to be at the top of the notes app repository." >&2
+if [ ! -f "$SCRIPT_DIR/user-data.sh" ]; then
+  echo "There is no user-data.sh in $SCRIPT_DIR." >&2
+  echo "This script has to be next to user-data.sh." >&2
   exit 1
 fi
-
-if ! docker info >/dev/null 2>&1; then
-  echo "Docker isn't running. Start Docker Desktop and run this script again." >&2
-  exit 1
-fi
-
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="${1:-$NAME-uploads-$ACCOUNT_ID}"
-REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
-IMAGE="$REGISTRY/$NAME:latest"
 
 echo "Creating infrastructure in $REGION"
 echo
 
 # ---------------------------------------------------------------------------
-# 1. The bucket
-# ---------------------------------------------------------------------------
-
-if aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
-  echo "Bucket $BUCKET already exists"
-else
-  echo "Creating bucket $BUCKET"
-
-  if ! aws s3api create-bucket \
-    --bucket "$BUCKET" \
-    --region "$REGION" \
-    --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null 2>&1; then
-    echo "Could not create the bucket $BUCKET." >&2
-    echo "The name is probably taken by another AWS account. Run the script again" >&2
-    echo "with a name of your own, for example:" >&2
-    echo "  ./create-infrastructure.sh notes-app-cloudfront-uploads-yourname" >&2
-    exit 1
-  fi
-
-  aws s3api put-public-access-block \
-    --bucket "$BUCKET" \
-    --public-access-block-configuration \
-      "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-fi
-
-# ---------------------------------------------------------------------------
-# 2. The repository and the image
-# ---------------------------------------------------------------------------
-
-if aws ecr describe-repositories --region "$REGION" --repository-names "$NAME" >/dev/null 2>&1; then
-  echo "Repository $NAME already exists"
-else
-  echo "Creating repository $NAME"
-
-  aws ecr create-repository \
-    --region "$REGION" \
-    --repository-name "$NAME" >/dev/null
-fi
-
-echo "Building the image, which can take a few minutes"
-
-docker build \
-  --platform linux/amd64 \
-  --target production \
-  -t "$IMAGE" \
-  "$SCRIPT_DIR"
-
-echo "Pushing the image to $REGISTRY"
-
-aws ecr get-login-password --region "$REGION" \
-  | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
-
-docker push "$IMAGE"
-
-# ---------------------------------------------------------------------------
-# 3. The settings
-# ---------------------------------------------------------------------------
-
-echo "Storing the settings under $PARAM_PATH/"
-
-aws ssm put-parameter \
-  --region "$REGION" \
-  --name "$PARAM_PATH/S3_BUCKET" \
-  --type String \
-  --value "$BUCKET" \
-  --overwrite >/dev/null
-
-aws ssm put-parameter \
-  --region "$REGION" \
-  --name "$PARAM_PATH/AWS_REGION" \
-  --type String \
-  --value "$REGION" \
-  --overwrite >/dev/null
-
-# ---------------------------------------------------------------------------
-# 4. The security group
+# 1. The security group
+#
+# HTTP is only allowed in from the addresses CloudFront connects from. AWS
+# keeps that list up to date as a managed prefix list. Session Manager doesn't
+# use SSH, so port 80 is the only port the instance needs open.
 # ---------------------------------------------------------------------------
 
 VPC_ID=$(aws ec2 describe-vpcs \
@@ -134,33 +57,36 @@ SG_ID=$(aws ec2 describe-security-groups \
 
 if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
   echo "Security group $NAME-sg already exists ($SG_ID)"
-  SG_EXISTED=yes
 else
   echo "Creating security group $NAME-sg"
 
   SG_ID=$(aws ec2 create-security-group \
     --region "$REGION" \
     --group-name "$NAME-sg" \
-    --description "Notes app behind CloudFront: HTTP in" \
+    --description "Notes app behind CloudFront: HTTP in from CloudFront only" \
     --vpc-id "$VPC_ID" \
     --query 'GroupId' \
     --output text)
-  SG_EXISTED=no
-fi
 
-# The rule is only added to a new group. If the group already exists you may
-# have replaced this rule with the CloudFront one, and adding it back would
-# open the instance to everyone again.
+  PREFIX_LIST_ID=$(aws ec2 describe-managed-prefix-lists \
+    --region "$REGION" \
+    --filters "Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing" \
+    --query 'PrefixLists[0].PrefixListId' \
+    --output text)
 
-if [ "$SG_EXISTED" = no ]; then
   aws ec2 authorize-security-group-ingress \
     --region "$REGION" \
     --group-id "$SG_ID" \
-    --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null
+    --ip-permissions "IpProtocol=tcp,FromPort=80,ToPort=80,PrefixListIds=[{PrefixListId=$PREFIX_LIST_ID}]" \
+    >/dev/null
 fi
 
 # ---------------------------------------------------------------------------
-# 5. The IAM role
+# 2. The IAM role
+#
+# The instance only needs Session Manager, so you can open a shell on it if
+# the app doesn't start. It doesn't need to log in anywhere to pull a public
+# image.
 # ---------------------------------------------------------------------------
 
 if aws iam get-role --role-name "$NAME-role" >/dev/null 2>&1; then
@@ -184,69 +110,6 @@ aws iam attach-role-policy \
   --role-name "$NAME-role" \
   --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 
-aws iam put-role-policy \
-  --role-name "$NAME-role" \
-  --policy-name NotesAppUploads \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Sid\": \"ReadWriteUploads\",
-      \"Effect\": \"Allow\",
-      \"Action\": [\"s3:PutObject\", \"s3:GetObject\"],
-      \"Resource\": \"arn:aws:s3:::$BUCKET/*\"
-    }]
-  }"
-
-# GetAuthorizationToken is the login step and cannot be limited to one
-# repository. The three actions that read an image are limited to this one.
-
-aws iam put-role-policy \
-  --role-name "$NAME-role" \
-  --policy-name NotesAppPullImage \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [
-      {
-        \"Sid\": \"LogIntoTheRegistry\",
-        \"Effect\": \"Allow\",
-        \"Action\": \"ecr:GetAuthorizationToken\",
-        \"Resource\": \"*\"
-      },
-      {
-        \"Sid\": \"PullThisRepository\",
-        \"Effect\": \"Allow\",
-        \"Action\": [
-          \"ecr:BatchGetImage\",
-          \"ecr:GetDownloadUrlForLayer\",
-          \"ecr:BatchCheckLayerAvailability\"
-        ],
-        \"Resource\": \"arn:aws:ecr:$REGION:$ACCOUNT_ID:repository/$NAME\"
-      }
-    ]
-  }"
-
-# Neither setting is a SecureString, so no kms:Decrypt is needed.
-
-aws iam put-role-policy \
-  --role-name "$NAME-role" \
-  --policy-name NotesAppConfiguration \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Sid\": \"ReadTheSettings\",
-      \"Effect\": \"Allow\",
-      \"Action\": [
-        \"ssm:GetParameter\",
-        \"ssm:GetParameters\",
-        \"ssm:GetParametersByPath\"
-      ],
-      \"Resource\": [
-        \"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM_PATH\",
-        \"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM_PATH/*\"
-      ]
-    }]
-  }"
-
 # An EC2 instance is given an instance profile, which holds exactly one role.
 
 PROFILE_CREATED=no
@@ -264,7 +127,12 @@ aws iam add-role-to-instance-profile \
   --role-name "$NAME-role" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
-# 6. The instance
+# 3. The instance
+#
+# Amazon Linux 2023 on a t3.micro, in the default VPC, with the user data
+# from user-data.sh. AWS publishes the ID of the newest Amazon Linux image in
+# Parameter Store, so the script asks for it rather than naming one that goes
+# out of date.
 # ---------------------------------------------------------------------------
 
 INSTANCE_ID=$(aws ec2 describe-instances \
@@ -322,21 +190,139 @@ fi
 echo "Waiting for $INSTANCE_ID to start"
 aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 
+# ---------------------------------------------------------------------------
+# 4. The Elastic IP
+#
+# CloudFront finds the instance by its public DNS name, and that name has the
+# instance's address in it. An Elastic IP keeps the address, and so the name,
+# the same until it is released.
+# ---------------------------------------------------------------------------
+
+ALLOCATION_ID=$(aws ec2 describe-addresses \
+  --region "$REGION" \
+  --filters "Name=tag:Name,Values=$NAME" \
+  --query 'Addresses[0].AllocationId' \
+  --output text)
+
+if [ -n "$ALLOCATION_ID" ] && [ "$ALLOCATION_ID" != "None" ]; then
+  echo "Elastic IP $NAME already exists ($ALLOCATION_ID)"
+else
+  echo "Allocating an Elastic IP"
+
+  ALLOCATION_ID=$(aws ec2 allocate-address \
+    --region "$REGION" \
+    --domain vpc \
+    --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=$NAME}]" \
+    --query 'AllocationId' \
+    --output text)
+fi
+
+echo "Attaching the Elastic IP to $INSTANCE_ID"
+
+aws ec2 associate-address \
+  --region "$REGION" \
+  --instance-id "$INSTANCE_ID" \
+  --allocation-id "$ALLOCATION_ID" \
+  --allow-reassociation >/dev/null
+
+ELASTIC_IP=$(aws ec2 describe-addresses \
+  --region "$REGION" \
+  --allocation-ids "$ALLOCATION_ID" \
+  --query 'Addresses[0].PublicIp' \
+  --output text)
+
+# The instance's public DNS name can take a few seconds to change over to the
+# Elastic IP's name, and the distribution needs the new one.
+
+for _ in $(seq 1 12); do
+  CURRENT_IP=$(aws ec2 describe-instances \
+    --region "$REGION" \
+    --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' \
+    --output text)
+  [ "$CURRENT_IP" = "$ELASTIC_IP" ] && break
+  sleep 5
+done
+
 PUBLIC_DNS=$(aws ec2 describe-instances \
   --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \
   --query 'Reservations[0].Instances[0].PublicDnsName' \
   --output text)
 
-# The instance is running before its user data has finished installing Docker
-# and starting the app, which takes another minute or two. Checking here means
-# the summary only says the app is up when it is.
+# ---------------------------------------------------------------------------
+# 5. The distribution
+#
+# The settings are the ones the CloudFront tutorial chooses in the console.
+# HTTP is redirected to HTTPS, every method is allowed, nothing is cached, and
+# every header except Host is passed on to the instance.
+#
+# A distribution has no name, so the comment is how this script and the
+# destroy script find it again.
+# ---------------------------------------------------------------------------
 
-echo "Waiting for the app to answer on http://$PUBLIC_DNS"
+DIST_ID=$(aws cloudfront list-distributions \
+  --query "DistributionList.Items[?Comment=='$NAME'].Id | [0]" \
+  --output text)
+
+if [ -n "$DIST_ID" ] && [ "$DIST_ID" != "None" ]; then
+  echo "Distribution $NAME already exists ($DIST_ID)"
+else
+  echo "Creating a CloudFront distribution in front of $PUBLIC_DNS"
+
+  DIST_ID=$(aws cloudfront create-distribution \
+    --query 'Distribution.Id' \
+    --output text \
+    --distribution-config "{
+      \"CallerReference\": \"$NAME-$(date +%s)\",
+      \"Comment\": \"$NAME\",
+      \"Enabled\": true,
+      \"IsIPV6Enabled\": true,
+      \"HttpVersion\": \"http2\",
+      \"Origins\": {
+        \"Quantity\": 1,
+        \"Items\": [{
+          \"Id\": \"$NAME-instance\",
+          \"DomainName\": \"$PUBLIC_DNS\",
+          \"CustomOriginConfig\": {
+            \"HTTPPort\": 80,
+            \"HTTPSPort\": 443,
+            \"OriginProtocolPolicy\": \"http-only\",
+            \"OriginSslProtocols\": { \"Quantity\": 1, \"Items\": [\"TLSv1.2\"] }
+          }
+        }]
+      },
+      \"DefaultCacheBehavior\": {
+        \"TargetOriginId\": \"$NAME-instance\",
+        \"ViewerProtocolPolicy\": \"redirect-to-https\",
+        \"AllowedMethods\": {
+          \"Quantity\": 7,
+          \"Items\": [\"GET\", \"HEAD\", \"OPTIONS\", \"PUT\", \"POST\", \"PATCH\", \"DELETE\"],
+          \"CachedMethods\": { \"Quantity\": 2, \"Items\": [\"GET\", \"HEAD\"] }
+        },
+        \"CachePolicyId\": \"$CACHING_DISABLED\",
+        \"OriginRequestPolicyId\": \"$ALL_VIEWER_EXCEPT_HOST\"
+      }
+    }")
+fi
+
+DIST_DOMAIN=$(aws cloudfront get-distribution \
+  --id "$DIST_ID" \
+  --query 'Distribution.DomainName' \
+  --output text)
+
+echo "Waiting for $DIST_ID to deploy, which usually takes five to ten minutes"
+aws cloudfront wait distribution-deployed --id "$DIST_ID"
+
+# The security group only lets CloudFront in, so the app can only be checked
+# through the distribution. The instance may still be installing Docker and
+# starting the app, which takes a minute or two after it boots.
+
+echo "Waiting for the app to answer on https://$DIST_DOMAIN"
 
 APP_UP=no
 for _ in $(seq 1 36); do
-  if curl -fs -o /dev/null --max-time 5 "http://$PUBLIC_DNS/api/notes"; then
+  if curl -fs -o /dev/null --max-time 10 "https://$DIST_DOMAIN/api/notes"; then
     APP_UP=yes
     break
   fi
@@ -344,27 +330,23 @@ for _ in $(seq 1 36); do
 done
 
 if [ "$APP_UP" = yes ]; then
-  STATUS_LINE="The app is running at http://$PUBLIC_DNS"
+  STATUS_LINE="The app is running at https://$DIST_DOMAIN"
 else
-  STATUS_LINE="The app has not answered yet. If you have already locked the
-security group down to CloudFront, that is expected. Otherwise open a
-shell with Session Manager and run: sudo cat /var/log/cloud-init-output.log"
+  STATUS_LINE="The app has not answered yet. Wait a minute and open
+https://$DIST_DOMAIN in your browser. If it still fails, open a shell
+with Session Manager and run: sudo cat /var/log/cloud-init-output.log"
 fi
 
 cat <<SUMMARY
 
 Done.
 
-  Bucket     $BUCKET
-  Image      $IMAGE
-  Settings   $PARAM_PATH/S3_BUCKET, $PARAM_PATH/AWS_REGION
-  Security   $NAME-sg ($SG_ID)
-  Role       $NAME-role
-  Instance   $NAME ($INSTANCE_ID)
+  Security       $NAME-sg ($SG_ID), HTTP from CloudFront only
+  Role           $NAME-role
+  Instance       $NAME ($INSTANCE_ID)
+  Elastic IP     $ELASTIC_IP ($ALLOCATION_ID)
+  Distribution   $DIST_ID ($DIST_DOMAIN)
 
 $STATUS_LINE
-
-There is no Elastic IP and no CloudFront distribution. Making those two is
-the tutorial.
 
 SUMMARY
