@@ -19,6 +19,10 @@ set -euo pipefail
 
 export AWS_REGION=eu-west-1
 
+# Print output straight to the terminal, instead of opening it in a pager
+# that waits for you to press q
+export AWS_PAGER=""
+
 IMAGE=ghcr.io/mcandru/wdd-notes-app:load-balancing
 INSTANCE_TYPE=t3.micro
 SG_NAME=notes-instances-sg

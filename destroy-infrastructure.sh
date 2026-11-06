@@ -16,6 +16,10 @@ set -euo pipefail
 
 export AWS_REGION=eu-west-1
 
+# Print output straight to the terminal, instead of opening it in a pager
+# that waits for you to press q
+export AWS_PAGER=""
+
 ALB_NAME=notes-alb
 TARGET_GROUP_NAME=notes-targets
 SG_NAME=notes-instances-sg
@@ -93,7 +97,7 @@ delete_security_group() {
   echo "Deleting security group $name"
 
   for _ in $(seq 30); do
-    if aws ec2 delete-security-group --group-id "$id" 2> /dev/null; then
+    if aws ec2 delete-security-group --group-id "$id" > /dev/null 2>&1; then
       return 0
     fi
 
@@ -101,7 +105,7 @@ delete_security_group() {
   done
 
   # One last try, this time showing the error
-  aws ec2 delete-security-group --group-id "$id"
+  aws ec2 delete-security-group --group-id "$id" > /dev/null
 }
 
 # The instances' group goes first, because its inbound rule refers to the
