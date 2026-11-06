@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 function App() {
   const [notes, setNotes] = useState([]);
+  const [error, setError] = useState(null);
   const [text, setText] = useState("");
   const [file, setFile] = useState(null);
 
@@ -22,7 +23,16 @@ function App() {
     form.append("text", text);
     if (file) form.append("file", file);
 
-    fetch("/api/notes", { method: "POST", body: form }).then(() => {
+    fetch("/api/notes", { method: "POST", body: form }).then(async (res) => {
+      // When the backend won't save a note, it replies with a 4xx status and
+      // a body such as { "error": "Note text is required" }.
+      if (!res.ok) {
+        const body = await res.json();
+        setError(body.error);
+        return;
+      }
+
+      setError(null);
       setText("");
       setFile(null);
       event.target.reset();
@@ -43,6 +53,8 @@ function App() {
         <input type="file" onChange={(e) => setFile(e.target.files[0])} />
         <button type="submit">Add note</button>
       </form>
+
+      {error && <p role="alert">{error}</p>}
 
       <ul>
         {notes.map((note) => (
