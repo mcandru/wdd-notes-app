@@ -55,9 +55,25 @@ TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
   --query "TargetGroups[?TargetGroupName=='$TARGET_GROUP_NAME'] | [0].TargetGroupArn" \
   --output text)
 
+# AWS reports the load balancer as deleted shortly before it releases the
+# target group, so the first attempts can fail with ResourceInUse. Keep trying
+# for up to a minute.
+
 if [ "$TARGET_GROUP_ARN" != "None" ]; then
   echo "Deleting target group $TARGET_GROUP_NAME"
-  aws elbv2 delete-target-group --target-group-arn "$TARGET_GROUP_ARN"
+
+  for _ in $(seq 12); do
+    if aws elbv2 delete-target-group --target-group-arn "$TARGET_GROUP_ARN" 2> /dev/null; then
+      break
+    fi
+
+    sleep 5
+  done
+
+  # If it still exists, one last try that shows the error
+  if aws elbv2 describe-target-groups --target-group-arns "$TARGET_GROUP_ARN" > /dev/null 2>&1; then
+    aws elbv2 delete-target-group --target-group-arn "$TARGET_GROUP_ARN"
+  fi
 fi
 
 # Instances. A security group can't be deleted while an instance uses it.

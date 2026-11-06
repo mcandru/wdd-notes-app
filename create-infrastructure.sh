@@ -186,7 +186,7 @@ aws ec2 wait instance-running --instance-ids "$INSTANCE_1" "$INSTANCE_2"
 
 aws ec2 describe-instances \
   --instance-ids "$INSTANCE_1" "$INSTANCE_2" \
-  --query 'Reservations[].Instances[].{Name: Tags[?Key==`Name`] | [0].Value, Zone: Placement.AvailabilityZone, PublicIP: PublicIpAddress}' \
+  --query 'Reservations[].Instances[].{Name: Tags[?Key==`Name`] | [0].Value, ID: InstanceId, Zone: Placement.AvailabilityZone, PublicIP: PublicIpAddress}' \
   --output table
 
 echo
