@@ -38,10 +38,6 @@ COPY backend/ ./
 # Copies the static build from the frontend stage into the ./dist folder
 COPY --from=frontend /backend/dist ./dist
 
-# The folder for uploads when S3_BUCKET is not set. Owned by the node user,
-# so the app can write to it without running as root.
-RUN mkdir -p uploads && chown node:node uploads
-
 # Don't run the app as root
 USER node
 
