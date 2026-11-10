@@ -1,18 +1,30 @@
-Example code for a simple notes app that will be used in tutorials for IADT's Web Development and Delivery module.
+# Notes app
 
-## How to run the backend
+## Running it on AWS
 
-```bash
-cd backend
-cp .env.example .env
-npm install
-npm run dev
-```
-
-## How to run the frontend
+You need the AWS CLI, signed in with `aws login`.
 
 ```bash
-cd frontend
-npm install
-npm run dev
+./scripts/create-infrastructure.sh
 ```
+
+When the tutorial asks to create a load balancer, run:
+
+```bash
+./scripts/create-load-balancer.sh
+```
+
+When you're finished, delete everything:
+
+```bash
+./scripts/destroy-infrastructure.sh
+```
+
+## Running it locally
+
+```bash
+docker compose up --build
+```
+
+Then open <http://localhost:8000>. Locally, attached files are written to
+`backend/uploads` instead of S3.

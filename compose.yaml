@@ -1,0 +1,13 @@
+services:
+  app:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    environment:
+      INSTANCE_NAME: local
+      MAX_NOTE_LENGTH: 500

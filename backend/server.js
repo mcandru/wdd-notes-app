@@ -1,26 +1,13 @@
 import "dotenv/config";
-import express from "express";
+
+import app, { instanceName, usingS3 } from "./app.js";
 
 const port = process.env.PORT || 8080;
 
-const app = express();
-
-app.use(express.static("public"));
-
-const notes = [
-  { id: 1, text: "Buy milk" },
-  { id: 2, text: "Finish the deployment tutorial" },
-  { id: 3, text: "Water the plants" },
-];
-
-app.get("/", (req, res) => {
-  res.send("Hello from Express!");
-});
-
-app.get("/api/notes", (req, res) => {
-  res.json(notes);
-});
-
 app.listen(port, () => {
   console.log(`Listening on http://localhost:${port}`);
+  console.log(`Instance name: ${instanceName}`);
+  console.log(
+    `Storing uploaded files ${usingS3 ? "in S3" : "in backend/uploads"}`,
+  );
 });
