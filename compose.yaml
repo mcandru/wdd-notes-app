@@ -1,0 +1,49 @@
+services:
+  app:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - uploads-data:/app/uploads
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: notes
+      DB_NAME: notes
+      # Where OpenTelemetry sends the logs (see backend/instrumentation.js)
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-lgtm:4318
+      # Sends metrics every 10 seconds instead of every 60
+      OTEL_METRIC_EXPORT_INTERVAL: 10000
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: notes
+      MYSQL_DATABASE: notes
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pnotes"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Grafana, with Loki to store logs, Tempo for traces and Prometheus for
+  # metrics. Open http://localhost:3001. Everything in it is deleted when the
+  # container is removed.
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.36.0
+    ports:
+      - "3001:3000" # Grafana
+
+volumes:
+  db-data:
+  uploads-data:
