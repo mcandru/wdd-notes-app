@@ -3,6 +3,9 @@ import { defineConfig } from "vitest/config";
 // The tests use a database of their own, so that they never change your notes.
 process.env.DB_NAME = "notes_test";
 
+// The tests save a lot of notes, so they would hit the normal rate limit.
+process.env.NOTES_RATE_LIMIT = "1000";
+
 export default defineConfig({
   test: {
     globalSetup: "./tests/setup.js",

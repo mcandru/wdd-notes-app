@@ -7,6 +7,7 @@ import { pinoHttp } from "pino-http";
 import { upload, getFileUrl, usingS3, uploadsDir } from "./uploads.js";
 import { validateNoteText } from "./validation.js";
 import { logger } from "./logger.js";
+import { notesRateLimit } from "./rate-limit.js";
 
 // A pool keeps a few connections to the database open, and shares them
 // between requests.
@@ -94,34 +95,39 @@ app.get("/api/notes", async (req, res) => {
 
 // upload.single("file") runs before this handler. By the time the handler is
 // reached the file has already been saved, and req.file describes where it is stored
-app.post("/api/notes", upload.single("file"), async (req, res) => {
-  const error = validateNoteText(req.body.text);
+app.post(
+  "/api/notes",
+  notesRateLimit,
+  upload.single("file"),
+  async (req, res) => {
+    const error = validateNoteText(req.body.text);
 
-  if (error) {
-    return res.status(400).json({ error });
-  }
+    if (error) {
+      return res.status(400).json({ error });
+    }
 
-  const note = {
-    text: req.body.text,
-    // multer-s3 calls it "key", diskStorage "filename".
-    file: req.file ? req.file.key || req.file.filename : null,
-  };
+    const note = {
+      text: req.body.text,
+      // multer-s3 calls it "key", diskStorage "filename".
+      file: req.file ? req.file.key || req.file.filename : null,
+    };
 
-  const [result] = await db.execute(
-    "INSERT INTO notes (body, attachment) VALUES (?, ?)",
-    [note.text, note.file],
-  );
+    const [result] = await db.execute(
+      "INSERT INTO notes (body, attachment) VALUES (?, ?)",
+      [note.text, note.file],
+    );
 
-  req.log.info({ note_id: result.insertId }, "Saved a note");
-  trace.getActiveSpan()?.setAttribute("note.id", result.insertId);
-  notesCreated.add(1);
+    req.log.info({ note_id: result.insertId }, "Saved a note");
+    trace.getActiveSpan()?.setAttribute("note.id", result.insertId);
+    notesCreated.add(1);
 
-  res.status(201).json({
-    id: result.insertId,
-    text: note.text,
-    attachment: note.file,
-  });
-});
+    res.status(201).json({
+      id: result.insertId,
+      text: note.text,
+      attachment: note.file,
+    });
+  },
+);
 
 // Errors from multer, such as a file over the size limit, are passed on to
 // here. Without this, Express answers every one of them with a 500.
