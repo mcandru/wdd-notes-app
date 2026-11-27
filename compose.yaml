@@ -5,6 +5,8 @@ services:
       target: dev
     ports:
       - "8000:8000"
+    cpus: 0.25
+    mem_limit: 512m
     volumes:
       - ./backend:/app
       - /app/node_modules
@@ -19,6 +21,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-lgtm:4318
       # Sends metrics every 10 seconds instead of every 60
       OTEL_METRIC_EXPORT_INTERVAL: 10000
+      NOTES_RATE_LIMIT: 100000
     depends_on:
       db:
         condition: service_healthy
