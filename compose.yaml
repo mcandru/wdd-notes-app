@@ -5,7 +5,8 @@ services:
       target: dev
     ports:
       - "8000:8000"
-    cpus: 0.25
+    command: npm start
+    cpus: 1
     mem_limit: 512m
     volumes:
       - ./backend:/app
