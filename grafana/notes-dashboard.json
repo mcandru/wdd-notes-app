@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(http_server_request_duration_seconds_count{job=\"notes-api\"}[5m]))",
+          "expr": "sum(rate(http_server_request_duration_seconds_count{job=\"notes-api\"}[1m]))",
           "legendFormat": "requests",
           "refId": "A"
         }
@@ -56,7 +56,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "(sum(rate(http_server_request_duration_seconds_count{job=\"notes-api\", http_response_status_code=~\"5..\"}[5m])) or vector(0)) / sum(rate(http_server_request_duration_seconds_count{job=\"notes-api\"}[5m]))",
+          "expr": "(sum(rate(http_server_request_duration_seconds_count{job=\"notes-api\", http_response_status_code=~\"5..\"}[1m])) or vector(0)) / sum(rate(http_server_request_duration_seconds_count{job=\"notes-api\"}[1m]))",
           "legendFormat": "5xx",
           "refId": "A"
         }
@@ -88,7 +88,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket{job=\"notes-api\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket{job=\"notes-api\"}[1m])))",
           "legendFormat": "p95",
           "refId": "A"
         }
@@ -120,7 +120,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(notes_created_total{job=\"notes-api\"}[5m]))",
+          "expr": "sum(increase(notes_created_total{job=\"notes-api\"}[1m]))",
           "legendFormat": "notes",
           "refId": "A"
         }
